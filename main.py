@@ -12,30 +12,43 @@ import torch
 import loadData
 import recognize
 import math
+import pandas as pd
 import train
 from train import UnitAwareTransformer
-from recognize import MONSTER_COUNT,intelligent_workers_debug
+from recognize import MONSTER_COUNT, intelligent_workers_debug
 from PIL import Image, ImageTk  # 需要安装Pillow库
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 class ArknightsApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Arknights Neural Network")
+        self.load_history_data()
+
+        self.main_panel = tk.Frame(self.root)
+        self.main_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 鼠标滚轮滚动历史面板
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<Shift-MouseWheel>", self._on_shift_mousewheel)
+        # 运行
         self.auto_fetch_running = False
         self.no_region = True
         self.first_recognize = True
+        # 用户选项
         self.is_invest = tk.BooleanVar(value=False)  # 添加投资状态变量
         self.game_mode = tk.StringVar(value="单人")  # 添加游戏模式变量，默认单人模式
         self.device_serial = tk.StringVar(value=loadData.manual_serial)  # 添加设备序列号变量
 
+        # 数据缓存
         self.left_monsters = {}
         self.right_monsters = {}
         self.images = {}
         self.progress_var = tk.StringVar()
         self.main_roi = None
 
-        # 添加统计信息的变量
+        # 统计
         self.total_fill_count = 0
         self.incorrect_fill_count = 0
         self.start_time = None
@@ -43,10 +56,56 @@ class ArknightsApp:
         self.load_images()
         self.create_widgets()
 
+        # 历史对局面板
+        self.history_visible = False
+        self.history_container = tk.Frame(self.root, bd=1, relief="sunken")
+
+        # Canvas & Scrollbars
+        self.history_canvas = tk.Canvas(self.history_container, bg="white")
+        self.history_vscroll = tk.Scrollbar(
+            self.history_container, orient="vertical",
+            command=self.history_canvas.yview)
+        self.history_hscroll = tk.Scrollbar(
+            self.history_container, orient="horizontal",
+            command=self.history_canvas.xview)
+
+        self.history_canvas.configure(
+            yscrollcommand=self.history_vscroll.set,
+            xscrollcommand=self.history_hscroll.set)
+
+        # 真正放内容的 Frame
+        self.history_frame = tk.Frame(self.history_canvas)
+        self.history_canvas.create_window(
+            (0, 0), window=self.history_frame, anchor="nw")
+
+        # 更新 scroll region
+        self.history_frame.bind(
+            "<Configure>",
+            lambda e: self.history_canvas.configure(
+                scrollregion=self.history_canvas.bbox("all"))
+        )
+
+        # Canvas + 两条滚动条在 history_container 里排版
+        self.history_canvas.grid(row=0, column=0, sticky="nsew")
+        self.history_vscroll.grid(row=0, column=1, sticky="ns")
+        self.history_hscroll.grid(row=1, column=0, sticky="ew")
+
+        # 让 Canvas 单元格可伸缩
+        self.history_container.grid_rowconfigure(0, weight=1)
+        self.history_container.grid_columnconfigure(0, weight=1)
+
         # 模型相关属性
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = None  # 模型实例
         self.load_model()  # 初始化时加载模型
+
+    def _on_mousewheel(self, event):
+        """滑动鼠标滚轮 → 垂直滚动错题本面板"""
+        self.history_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_shift_mousewheel(self, event):
+        """按住 Shift + 滚轮 → 水平滚动错题本面板"""
+        self.history_canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
 
     def load_images(self):
         # 获取系统缩放因子
@@ -92,8 +151,8 @@ class ArknightsApp:
 
     def create_widgets(self):
         # 创建顶层容器
-        self.top_container = tk.Frame(self.root)
-        self.bottom_container = tk.Frame(self.root)
+        self.top_container = tk.Frame(self.main_panel)
+        self.bottom_container = tk.Frame(self.main_panel)
 
         # 顶部容器布局（填充整个水平空间）
         self.top_container.pack(side=tk.TOP, fill=tk.X, pady=10)
@@ -104,8 +163,8 @@ class ArknightsApp:
         self.monster_center.pack(side=tk.TOP, anchor='center')
 
         # 创建左右怪物容器（添加边框和背景色）
-        self.left_frame = tk.Frame(self.monster_center,borderwidth=2,relief="groove",padx=5,pady=5)
-        self.right_frame = tk.Frame(self.monster_center,borderwidth=2,relief="groove",padx=5,pady=5)
+        self.left_frame = tk.Frame(self.monster_center, borderwidth=2, relief="groove", padx=5, pady=5)
+        self.right_frame = tk.Frame(self.monster_center, borderwidth=2, relief="groove", padx=5, pady=5)
 
         # 添加左右标题
         tk.Label(self.left_frame, text="左侧怪物", font=('Helvetica', 10, 'bold')).grid(row=0, columnspan=10)
@@ -138,17 +197,17 @@ class ArknightsApp:
                     )
 
         # 结果显示区域（增加边框）
-        self.result_frame = tk.Frame(self.bottom_container,relief="ridge",borderwidth=1)
+        self.result_frame = tk.Frame(self.bottom_container, relief="ridge", borderwidth=1)
         self.result_frame.pack(fill=tk.X, pady=5)
 
         # 使用更醒目的字体
-        self.result_label = tk.Label(self.result_frame,text="Prediction: ",font=("Helvetica", 16, "bold"),fg="blue")
+        self.result_label = tk.Label(self.result_frame, text="Prediction: ", font=("Helvetica", 16, "bold"), fg="blue")
         self.result_label.pack(pady=3)
-        self.stats_label = tk.Label(self.result_frame,text="",font=("Helvetica", 12),fg="green")
+        self.stats_label = tk.Label(self.result_frame, text="", font=("Helvetica", 12), fg="green")
         self.stats_label.pack(pady=3)
 
         # 按钮区域容器（增加边框和背景）
-        self.button_frame = tk.Frame(self.bottom_container,relief="groove",borderwidth=2,padx=10,pady=10)
+        self.button_frame = tk.Frame(self.bottom_container, relief="groove", borderwidth=2, padx=10, pady=10)
         self.button_frame.pack(fill=tk.BOTH, expand=True)
 
         # 按钮布局（分左右两列布局）
@@ -192,7 +251,7 @@ class ArknightsApp:
         ]
         # 单独处理自动获取数据按钮
         for text, cmd in action_buttons:
-            btn = tk.Button(action_col,text=text,command=cmd,width=14)  # 加宽按钮
+            btn = tk.Button(action_col, text=text, command=cmd, width=14)  # 加宽按钮
             btn.pack(pady=5, ipadx=5)
             if text == "自动获取数据":
                 self.auto_fetch_button = btn
@@ -203,10 +262,12 @@ class ArknightsApp:
         fill_buttons_frame.pack(pady=2)
 
         # 左侧的√按钮
-        tk.Button(fill_buttons_frame,text="填写√",command=self.fill_data_correct,width=8,bg="#C1E1C1").pack(side=tk.LEFT, padx=5)
+        tk.Button(fill_buttons_frame, text="填写√", command=self.fill_data_correct, width=8, bg="#C1E1C1").pack(
+            side=tk.LEFT, padx=5)
 
         # 右侧的×按钮
-        tk.Button(fill_buttons_frame,text="填写×",command=self.fill_data_incorrect,width=8,bg="#FFB3BA").pack(side=tk.RIGHT, padx=5)
+        tk.Button(fill_buttons_frame, text="填写×", command=self.fill_data_incorrect, width=8, bg="#FFB3BA").pack(
+            side=tk.RIGHT, padx=5)
 
         # 右侧按钮列（功能按钮）
         func_col = tk.Frame(right_buttons)
@@ -215,28 +276,354 @@ class ArknightsApp:
         # 预测功能组
         predict_frame = tk.Frame(func_col)
         predict_frame.pack(pady=2)
-        self.predict_button = tk.Button(predict_frame,text="预测",command=self.predict,width=8,bg="#FFE4B5")
+        self.predict_button = tk.Button(predict_frame, text="预测", command=self.predict, width=8, bg="#FFE4B5")
         self.predict_button.pack(side=tk.LEFT, padx=2)
 
-        self.recognize_button = tk.Button(predict_frame,text="识别并预测",command=self.recognize,width=10,bg="#98FB98")
+        self.recognize_button = tk.Button(predict_frame, text="识别并预测", command=self.recognize, width=10,
+                                          bg="#98FB98")
         self.recognize_button.pack(side=tk.LEFT, padx=2)
 
-        self.reset_button = tk.Button(predict_frame,text="归零",command=self.reset_entries,width=6)
+        self.reset_button = tk.Button(predict_frame, text="归零", command=self.reset_entries, width=6)
         self.reset_button.pack(side=tk.LEFT, padx=2)
 
         # 设备序列号组（独立行）
         serial_frame = tk.Frame(func_col)
         serial_frame.pack(pady=5)
 
-        self.reselect_button = tk.Button(serial_frame, text="选择范围", command=self.reselect_roi,width=10)
+        self.reselect_button = tk.Button(serial_frame, text="选择范围", command=self.reselect_roi, width=10)
         self.reselect_button.pack(side=tk.LEFT)
 
         tk.Label(serial_frame, text="设备号:").pack(side=tk.LEFT)
-        self.serial_entry = tk.Entry(serial_frame,textvariable=self.device_serial,width=15)
+        self.serial_entry = tk.Entry(serial_frame, textvariable=self.device_serial, width=15)
         self.serial_entry.pack(side=tk.LEFT, padx=3)
 
-        self.serial_button = tk.Button(serial_frame,text="更新",command=self.update_device_serial,width=6)
+        self.serial_button = tk.Button(serial_frame, text="更新", command=self.update_device_serial, width=6)
         self.serial_button.pack(side=tk.LEFT)
+
+        # 错题本开关
+        self.history_button = tk.Button(
+            func_col, text="显示错题本",
+            command=self.toggle_history_panel, width=10
+        )
+        self.history_button.pack(pady=4)  # 可以 side=tk.TOP / BOTTOM 都行
+
+    def toggle_history_panel(self):
+        if not self.history_visible:
+            self.history_container.pack(side="right", fill="both", padx=5, pady=5)
+            self.history_button.config(text="隐藏错题本")
+            for w in self.history_frame.winfo_children():
+                w.destroy()
+            self.render_similar_matches(self.history_frame)
+            self.history_canvas.configure(scrollregion=self.history_canvas.bbox("all"))
+        else:
+            self.history_container.pack_forget()
+            self.history_button.config(text="显示错题本")
+        self.history_visible = not self.history_visible
+
+    def load_history_data(self):
+        """错题本读取的数据集，只在 __init__ 里启动时调用"""
+        df = pd.read_csv(
+            "arknights.csv",
+            header=0,  # 默认表给有header
+            engine="python",
+            on_bad_lines="skip"
+        )
+        self.past_left = df.iloc[:, 0:56].to_numpy(float)
+        self.past_right = df.iloc[:, 56:112].to_numpy(float)
+        self.labels = df.iloc[:, 112].to_numpy()
+        # 组合特征
+        self.feat_past = np.hstack([
+            self.past_left + self.past_right,
+            np.abs(self.past_left - self.past_right)
+        ])
+        self.N_history = len(self.past_left)
+
+    def render_similar_matches(self, parent):
+        try:
+            cur_left = np.zeros(56, dtype=float)
+            cur_right = np.zeros(56, dtype=float)
+            for name, e in self.left_monsters.items():
+                v = e.get()
+                if v.isdigit(): cur_left[int(name) - 1] = float(v)
+            for name, e in self.right_monsters.items():
+                v = e.get()
+                if v.isdigit(): cur_right[int(name) - 1] = float(v)
+
+            setL_cur = set(np.where(cur_left > 0)[0])
+            setR_cur = set(np.where(cur_right > 0)[0])
+
+            # 相似度和特征
+            feat_cur = np.hstack([
+                cur_left + cur_right,
+                np.abs(cur_left - cur_right)
+            ]).reshape(1, -1)
+            sims = cosine_similarity(feat_cur, self.feat_past)[0]  # shape (N_history,)
+
+            N = self.N_history
+            # 数组
+            cats = np.empty(N, np.int8)
+            qdiff_other = np.empty(N, np.int16)
+            match_other = np.empty(N, np.int16)
+            swap = np.zeros(N, dtype=bool)
+
+            # 分类函数
+            def classify(typeL_eq, typeR_eq, cntL_eq, cntR_eq):
+                if typeL_eq and typeR_eq and cntL_eq and cntR_eq:
+                    return 0
+                if typeL_eq and typeR_eq:
+                    return 1 if (cntL_eq or cntR_eq) else 2
+                if (typeL_eq and cntL_eq) or (typeR_eq and cntR_eq):
+                    return 3
+                if typeL_eq or typeR_eq:
+                    return 4
+                return 5
+
+            # 逻辑
+            for i in range(N):
+                Lraw, Rraw = self.past_left[i], self.past_right[i]
+
+                # 判断要不要镜像
+                missA = len(setL_cur ^ set(np.where(Lraw > 0)[0])) + \
+                        len(setR_cur ^ set(np.where(Rraw > 0)[0]))
+                cntA = int(np.abs(Lraw - cur_left).sum() +
+                           np.abs(Rraw - cur_right).sum())
+
+                missB = len(setL_cur ^ set(np.where(Rraw > 0)[0])) + \
+                        len(setR_cur ^ set(np.where(Lraw > 0)[0]))
+                cntB = int(np.abs(Rraw - cur_left).sum() +
+                           np.abs(Lraw - cur_right).sum())
+
+                if (missB, cntB) < (missA, cntA):
+                    swap[i] = True
+                    Lh, Rh = Rraw, Lraw
+                else:
+                    Lh, Rh = Lraw, Rraw
+
+                need_L = np.where(cur_left > 0)[0]
+                need_R = np.where(cur_right > 0)[0]
+                setL_h = set(np.where(Lh > 0)[0])
+                setR_h = set(np.where(Rh > 0)[0])
+
+                full_L = np.all(Lh[need_L] == cur_left[need_L])
+                full_R = np.all(Rh[need_R] == cur_right[need_R])
+
+                diff_L = int(np.abs(Lh[need_L] - cur_left[need_L]).sum())
+                diff_R = int(np.abs(Rh[need_R] - cur_right[need_R]).sum())
+
+                hit_other_R = len(setR_h & set(need_R))
+                hit_other_L = len(setL_h & set(need_L))
+                match_other[i] = min(hit_other_L, hit_other_R)
+                if hit_other_R and not full_R:
+                    qdiff_other[i] = diff_R
+                elif hit_other_L and not full_L:
+                    qdiff_other[i] = diff_L
+                else:
+                    qdiff_other[i] = 0
+
+                # 分类
+                cats[i] = classify(
+                    setL_h == setL_cur,
+                    setR_h == setR_cur,
+                    np.array_equal(Lh, cur_left),
+                    np.array_equal(Rh, cur_right)
+                )
+
+            # 排序
+            order = np.lexsort((-sims, qdiff_other, -match_other, cats))
+            good = order[match_other[order] > 0]
+            backup = order[match_other[order] == 0]
+
+            # 前5和前20的index
+            top20_idx = np.concatenate((good, backup))[:20]
+            top5_idx = top20_idx[:5]
+
+            # 胜率计算和标题渲染
+            tgtL = max((i for i, v in enumerate(cur_left) if v > 0),
+                       key=cur_left.__getitem__, default=None)
+            tgtR = max((i for i, v in enumerate(cur_right) if v > 0),
+                       key=cur_right.__getitem__, default=None)
+
+            lw = rw = 0
+            for idx in top5_idx:
+                lab = self.labels[idx]
+                Lh, Rh = self.past_left[idx], self.past_right[idx]
+                if swap[idx]:
+                    lab = 'L' if lab == 'R' else 'R'
+                    Lh, Rh = Rh, Lh
+                if tgtL is not None:
+                    side = 'L' if Lh[tgtL] > 0 else 'R'
+                    lw += (lab == side)
+                if tgtR is not None:
+                    side = 'L' if Lh[tgtR] > 0 else 'R'
+                    rw += (lab == side)
+
+            # stats
+            lw = 0
+            for idx in top5_idx:
+                lab = self.labels[idx]
+                # 用本地的 swap，不要用 self._swap
+                if swap[idx]:
+                    lab = 'L' if lab == 'R' else 'R'
+                if lab == 'L':
+                    lw += 1
+            rw = len(top5_idx) - lw
+
+            # top5胜率
+            n = len(top5_idx)
+            if n > 0:
+                left_rate = lw / n
+                right_rate = rw / n
+            else:
+                left_rate = right_rate = 0
+            input_types = set(np.where(cur_left > 0)[0]) | set(np.where(cur_right > 0)[0])
+            perfect_count = 0
+            for i in top5_idx:
+                if swap[i]:
+                    Lh, Rh = self.past_right[i], self.past_left[i]
+                else:
+                    Lh, Rh = self.past_left[i], self.past_right[i]
+                record_types = set(np.where(Lh > 0)[0]) | set(np.where(Rh > 0)[0])
+                if record_types == input_types:
+                    perfect_count += 1
+            # 标题
+            head = tk.Frame(parent);
+            head.pack(fill="x", pady=4)
+            fgL, fgR = ("#E23F25", "#666") if left_rate > right_rate else ("#666", "#25ace2")
+            tk.Label(head, text="近5条左右胜率：", font=("Helvetica", 12, "bold")).pack(side="left")
+            tk.Label(head, text=f"左边 {left_rate:.2%}  ", fg=fgL, font=("Helvetica", 12, "bold")).pack(side="left")
+            tk.Label(head, text=f"右边 {right_rate:.2%}", fg=fgR, font=("Helvetica", 12, "bold")).pack(side="left")
+
+            # 彩蛋
+            target_id_left = max((i for i, v in enumerate(cur_left) if v > 0),
+                                 key=cur_left.__getitem__, default=None)
+            target_id_right = max((i for i, v in enumerate(cur_right) if v > 0),
+                                  key=cur_right.__getitem__, default=None)
+
+            message = ""
+
+            # 苏茜
+            if perfect_count == len(top5_idx) and (
+                    (target_id_left in (30, 35) and left_rate == 1.0) or
+                    (target_id_right in (30, 35) and right_rate == 1.0)
+            ):
+                winner = "左边" if (target_id_left in (30, 35) and left_rate == 1.0) else "右边"
+                message = f"苏茜决定全力支持{winner}！"
+                msg_fg = "#ff99cc"
+
+            # 维什戴尔
+            elif perfect_count == len(top5_idx) and (left_rate == 1.0 or right_rate == 1.0):
+                side = "左边" if left_rate == 1.0 else "右边"
+                message = f"干员维什戴尔决定选择{side}！"
+                msg_fg = "#444"
+
+            # 刻俄柏
+            elif perfect_count == len(top5_idx) and (
+                    abs(left_rate - 0.20) < 1e-6 or abs(right_rate - 0.20) < 1e-6
+            ):
+                side = "左边" if left_rate <= 0.20 else "右边"
+                message = f"干员刻俄柏觉得{side}能找到香甜的密饼！"
+                msg_fg = "#444"
+
+            # 渲染彩蛋
+            if message:
+                tk.Label(parent, text=message,
+                         font=("Helvetica", 11, "bold"),
+                         fg=msg_fg).pack(fill="x", pady=(2, 8))
+
+            same_types = set(need_L) == set(need_R)
+            has_left = np.any(cur_left > 0)
+            has_right = np.any(cur_right > 0)
+
+            # 错题本主体渲染
+            self._history_parent = parent
+            self._top20 = top20_idx.tolist()
+            self._sims = sims
+            self._swap = swap
+            self._batch_idx = 0
+            parent.after(0, lambda: self._render_batch(batch_size=5))
+
+        except Exception as e:
+            print("[渲染错题本失败]", e)
+
+    def _render_batch(self, batch_size=5):
+        start = self._batch_idx * batch_size
+        end = start + batch_size
+        parent = self._history_parent
+
+        for rank, idx in enumerate(self._top20[start:end], start + 1):
+            sims_val = self._sims[idx]
+            swapped = self._swap[idx]
+            Lh, Rh = (self.past_left if not swapped else self.past_right)[idx], \
+                (self.past_right if not swapped else self.past_left)[idx]
+            lab = self.labels[idx]
+            if swapped:
+                lab = 'L' if lab == 'R' else 'R'
+            winL, winR = (lab == 'L'), (lab == 'R')
+
+            # csv中的行数=局数
+            real_no = idx + 2
+
+            row = tk.Frame(parent, pady=6)
+            row.pack(fill="x")
+
+            # 局数
+            tk.Label(
+                row,
+                text=f"第 {real_no} 局",
+                font=("Helvetica", 10),
+            ).pack(anchor="w", padx=4)
+
+            # 相似度
+            tk.Label(
+                row,
+                text=f"{rank}. 相似度 {sims_val:.2f}",
+                font=("Helvetica", 10, "bold")
+            ).pack(fill="x")
+
+            # 左右阵容渲染
+            for side, vec, is_win, bg_win, fg_win, bd_win in (
+                    ('左', Lh, winL, "#ffe5e5", "#E23F25", "red"),
+                    ('右', Rh, winR, "#e5e5ff", "#25ace2", "blue"),
+            ):
+                bg = bg_win if is_win else "#f0f0f0"
+                fg = fg_win if is_win else "#666"
+                bd = bd_win if is_win else "#aaa"
+                pane = tk.Frame(
+                    row,
+                    bd=2,
+                    relief="solid",
+                    bg=bg,
+                    highlightbackground=bd,
+                    highlightthickness=2
+                )
+                pane.pack(
+                    side="left",
+                    expand=True,
+                    fill="both",
+                    padx=(8, 4) if side == '左' else (4, 8)
+                )
+                tk.Label(
+                    pane,
+                    text=f"{side}边",
+                    fg=fg,
+                    bg=bg,
+                    font=("Helvetica", 9, "bold")
+                ).pack(anchor="w", padx=4)
+                inner = tk.Frame(pane, bg=bg)
+                inner.pack(fill="x", padx=4, pady=2)
+                for i, cnt in enumerate(vec):
+                    if cnt > 0:
+                        img = self.images[str(i + 1)]
+                        tk.Label(inner, image=img, bg=bg).pack(side="left", padx=2)
+                        tk.Label(inner, text=f"×{int(cnt)}", bg=bg) \
+                            .pack(side="left", padx=(0, 6))
+
+        self._batch_idx += 1
+
+        # 更新滚动区域
+        self.history_canvas.configure(scrollregion=self.history_canvas.bbox("all"))
+        if end < len(self._top20):
+            parent.after(50, lambda: self._render_batch(batch_size))
 
     def reset_entries(self):
         for entry in self.left_monsters.values():
@@ -275,13 +662,6 @@ class ArknightsApp:
 
         # 将数据转换为列表，并添加图片名称
         data_row = image_data.tolist()
-        if intelligent_workers_debug: # 如果处于debug模式
-            data_row.append(self.current_image_name)
-            # ==================在这里保存人工审核图片到本地==================
-            if self.current_image is not None:
-                os.makedirs('data/images', exist_ok=True)
-                image_path = os.path.join('data/images', self.current_image_name)
-                cv2.imwrite(image_path, self.current_image)
 
         with open('arknights.csv', 'a', newline='') as file:
             writer = csv.writer(file)
@@ -371,6 +751,14 @@ class ArknightsApp:
         self.current_prediction = self.get_prediction()
         self.predictText(self.current_prediction)
 
+        if self.history_visible:
+            for w in self.history_frame.winfo_children():
+                w.destroy()
+            self.render_similar_matches(self.history_frame)
+            self.history_canvas.configure(
+                scrollregion=self.history_canvas.bbox("all")
+            )
+
     def recognize(self):
         # 如果正在进行自动获取数据，从adb加载截图
         if self.auto_fetch_running:
@@ -378,19 +766,19 @@ class ArknightsApp:
         else:
             screenshot = None
 
-        if self.no_region: # 如果尚未选择区域，从adb获取截图
-            if self.first_recognize: # 首次识别时，尝试连接adb
+        if self.no_region:  # 如果尚未选择区域，从adb获取截图
+            if self.first_recognize:  # 首次识别时，尝试连接adb
                 self.main_roi = [
                     (int(0.2479 * loadData.screen_width), int(0.8410 * loadData.screen_height)),
                     (int(0.7526 * loadData.screen_width), int(0.9510 * loadData.screen_height))
                 ]
-                adb_path = loadData.adb_path # 从loadData获取adb路径
-                device_serial = loadData.device_serial # 从loadData获取设备号
+                adb_path = loadData.adb_path  # 从loadData获取adb路径
+                device_serial = loadData.device_serial  # 从loadData获取设备号
                 subprocess.run(f'{adb_path} connect {device_serial}', shell=True, check=True)
                 self.first_recognize = False
             screenshot = loadData.capture_screenshot()
 
-        results = recognize.process_regions(self.main_roi,screenshot=screenshot)
+        results = recognize.process_regions(self.main_roi, screenshot=screenshot)
         self.reset_entries()
 
         # 处理结果
@@ -519,7 +907,7 @@ class ArknightsApp:
                 self.auto_fetch_button.config(text="自动获取数据")
                 self.save_statistics_to_log()  # 保存统计信息到log.txt
                 break
-            #time.sleep(2)
+            # time.sleep(2)
             if keyboard.is_pressed('esc'):
                 self.auto_fetch_running = False
                 self.auto_fetch_button.config(text="自动获取数据")
@@ -537,7 +925,7 @@ class ArknightsApp:
         if screenshot is not None:
             results = loadData.match_images(screenshot, loadData.process_images)
             results = sorted(results, key=lambda x: x[1], reverse=True)
-            #print("匹配结果：", results[0])
+            # print("匹配结果：", results[0])
             for idx, score in results:
                 if score > 0.5:
                     if idx == 0:
@@ -558,12 +946,12 @@ class ArknightsApp:
                         print("开始游戏")
                     elif idx in [3, 4, 5, 15]:
                         time.sleep(1)
-                        #归零
+                        # 归零
                         self.reset_entries()
-                        #识别怪物类型数量
+                        # 识别怪物类型数量
                         self.recognize()
-                        #点击下一轮
-                        if self.is_invest.get():#投资
+                        # 点击下一轮
+                        if self.is_invest.get():  # 投资
                             # 根据预测结果点击投资左/右
                             if self.current_prediction > 0.5:
                                 if idx == 4:
@@ -578,14 +966,14 @@ class ArknightsApp:
                                     loadData.click(relative_points[3])
                                 print("投资左")
                             if self.game_mode.get() == "30人":
-                                time.sleep(20)#30人模式下，投资后需要等待20秒
-                        else:#不投资
+                                time.sleep(20)  # 30人模式下，投资后需要等待20秒
+                        else:  # 不投资
                             loadData.click(relative_points[4])
                             print("本轮观望")
                             time.sleep(5)
-                            
+
                     elif idx in [8, 9, 10, 11]:
-                        #判断本次是否填写错误
+                        # 判断本次是否填写错误
                         if self.calculate_average_yellow(screenshot):
                             self.fill_data('L')
                             if self.current_prediction > 0.5:
@@ -603,7 +991,7 @@ class ArknightsApp:
                         time.sleep(10)
                     elif idx in [6, 7, 14]:
                         print("等待战斗结束")
-                    elif idx in [12, 13]:  #返回主页
+                    elif idx in [12, 13]:  # 返回主页
                         loadData.click(relative_points[0])
                         print("返回主页")
                     break  # 匹配到第一个结果后退出
